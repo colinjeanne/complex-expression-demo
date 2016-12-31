@@ -1,0 +1,242 @@
+﻿<!doctype html>
+<html>
+   <head>
+      <title>Expression Parser</title>
+      <script src="expression.min.js"></script>
+      <script>
+         'use strict';
+
+         const pointFromPixel = (ptPixel, pixelWidth, pixelHeight, ptTopLeft, ptBottomRight) => {
+            const width = ptBottomRight[0] - ptTopLeft[0];
+            const height = ptBottomRight[1] - ptTopLeft[1];
+            return [ptPixel[0] * width / pixelWidth + ptTopLeft[0],
+                    ptPixel[1] * height / pixelHeight + ptTopLeft[1]];
+         };
+
+         const evaluationWorkerPromise = (worker, imageData, expression, colorizationMode, ptTopLeft, ptBottomRight) => {
+            return new Promise((resolve, reject) => {
+               worker.onmessage = e => resolve(e.data);
+
+               worker.postMessage({
+                  index: worker.index,
+                  pixelTop: worker.rowTopPixel,
+                  imageData: imageData,
+                  expression: expression,
+                  colorizationMode: colorizationMode,
+                  ptTopLeft: ptTopLeft,
+                  ptBottomRight: ptBottomRight
+               });
+            });
+         };
+
+         class ParallelGrapher {
+            constructor(context, maximumPixelsPerImage) {
+               this.context = context;
+               this.evaluationWorkers = [];
+               this.renderWorkers = [];
+
+               this.createEmptyFillPattern();
+
+               const canvas = this.context.canvas;
+               const rows = Math.ceil(canvas.width * canvas.height / maximumPixelsPerImage);
+               const numberOfWorkers = rows;
+
+               const rowHeight = Math.ceil(canvas.height / rows);
+               const finalRowHeight = canvas.height - (rows - 1) * rowHeight;
+
+               for (let i = 0; i < numberOfWorkers; ++i) {
+                  let rowTopPixel = i * rowHeight;
+                  const height = (i === rows - 1) ? finalRowHeight : rowHeight;
+
+                  const evaluationWorker = new Worker('evaluationWorker.js');
+                  evaluationWorker.rowTopPixel = rowTopPixel;
+                  evaluationWorker.rowHeight = height;
+                  evaluationWorker.index = i;
+                  evaluationWorker.onerror = e => { throw new Error(e.message + ' (' + e.filename + ':' + e.lineno + ')'); };
+
+                  this.evaluationWorkers.push(evaluationWorker);
+
+                  const renderWorker = new Worker('renderWorker.js');
+                  renderWorker.onmessage = e => this.context.putImageData(e.data, 0, rowTopPixel);
+
+                  renderWorker.onerror = e => { throw new Error(e.message + ' (' + e.filename + ':' + e.lineno + ')'); };
+
+                  this.renderWorkers.push(renderWorker);
+               }
+            }
+
+            createEmptyFillPattern() {
+               const emptyImage = new Image();
+               emptyImage.onload = () =>
+                  this.emptyFillPattern = this.context.createPattern(emptyImage, 'repeat');
+
+               emptyImage.src = 'empty.png';
+            }
+
+            drawBase() {
+               if (this.emptyFillPattern) {
+                  const width = this.context.canvas.width;
+                  const height = this.context.canvas.height;
+
+                  this.context.fillStyle = this.emptyFillPattern;
+                  this.context.fillRect(0, 0, width, height);
+               }
+            }
+
+            graph(expression, colorizationMode, colorizationFunction, ptTopLeft, ptBottomRight) {
+               const width = this.context.canvas.width;
+               const height = this.context.canvas.height;
+
+               this.drawBase();
+
+               if (colorizationFunction === 'conformalColorThin') {
+                  this.evaluationWorkers.forEach(w => {
+                     const realTopLeft = pointFromPixel([0, w.rowTopPixel], width, height, ptTopLeft, ptBottomRight);
+                     const realBottomRight = pointFromPixel([width - 1, w.rowTopPixel + w.rowHeight - 1], width, height, ptTopLeft, ptBottomRight);
+
+                     const imageData = this.context.getImageData(0, w.rowTopPixel, width, w.rowHeight);
+
+                     evaluationWorkerPromise(w, imageData, expression, 'magnitude', realTopLeft, realBottomRight)
+                        .then(result => {
+                           const values = result.values.map(value => Object.assign({}, value));
+
+                           this.renderWorkers[w.index].postMessage({
+                              canvasData: result.imageData,
+                              colorizationMode: colorizationMode,
+                              colorizationFunction: colorizationFunction,
+                              values: values,
+                              min: 0,
+                              max: 0
+                           });
+                        })
+                        .catch(e => {
+                           console.log(e);
+                        });
+                  });
+               } else if (colorizationFunction === 'nonconformalColorWithValue') {
+                  const evaluationPromises = this.evaluationWorkers.map(w => {
+                     const realTopLeft = pointFromPixel([0, w.rowTopPixel], width, height, ptTopLeft, ptBottomRight);
+                     const realBottomRight = pointFromPixel([width - 1, w.rowTopPixel + w.rowHeight - 1], width, height, ptTopLeft, ptBottomRight);
+
+                     const imageData = this.context.getImageData(0, w.rowTopPixel, width, w.rowHeight);
+
+                     return evaluationWorkerPromise(w, imageData, expression, colorizationMode, realTopLeft, realBottomRight);
+                  });
+
+                  Promise.all(evaluationPromises)
+                     .then(results => {
+                        const max = results.reduce(
+                           (previousValue, result) => (result.max > previousValue) ? result.max : previousValue,
+                           0);
+
+                        const min = results.reduce(
+                           (previousValue, result) => (result.min < previousValue) ? result.min : previousValue,
+                           Infinity);
+
+                        results.forEach(result => {
+                           const values = result.values.map(value => Object.assign({}, value));
+
+                           this.renderWorkers[result.index].postMessage({
+                              canvasData: result.imageData,
+                              colorizationMode: colorizationMode,
+                              colorizationFunction: colorizationFunction,
+                              values: values,
+                              min: min,
+                              max: max
+                           });
+                        });
+                     });
+               }
+            }
+         }
+
+         document.addEventListener('DOMContentLoaded', () => {
+            const Expression = require('expression').default;
+            const expr = document.getElementById("expr");
+            const result = document.getElementById("result");
+            const evaluate = document.getElementById("evaluate");
+            const eq = document.getElementById('eq');
+            const render = document.getElementById('render');
+            const graph = document.getElementById('graph');
+            const grapher = new ParallelGrapher(graph.getContext('2d'), 20000);
+
+            evaluate.addEventListener('click', () => {
+               const eq = new Expression(expr.value);
+               const val = eq.evaluate();
+               result.textContent = val.real + ' + ' + val.imaginary + 'i';
+            });
+
+            render.addEventListener('click', () => {
+               const topLeftX = document.getElementById('topLeftX');
+               const topLeftY = document.getElementById('topLeftY');
+               const bottomRightX = document.getElementById('bottomRightX');
+               const bottomRightY = document.getElementById('bottomRightY');
+
+               const ptTopLeft = [
+                  topLeftX.valueAsNumber,
+                  topLeftY.valueAsNumber
+               ];
+
+               const ptBottomRight = [
+                  bottomRightX.valueAsNumber,
+                  bottomRightY.valueAsNumber
+               ];
+
+               const colorization = document.getElementById('colorization')
+                  .selectedOptions[0].value;
+
+               const colorizationFunction = document.getElementById('colorizationFunction')
+                  .selectedOptions[0].value;
+
+               grapher.graph(eq.value, colorization, colorizationFunction, ptTopLeft, ptBottomRight);
+            });
+         });
+      </script>
+   </head>
+   <body>
+      <form>
+         <label>
+            Enter expression:
+            <input type="text" id="expr">
+         </label>
+         <label>
+            = <span id="result"></span>
+         </label>
+         <br>
+         <button id="evaluate" type="button">Evaluate</button>
+      </form>
+      <label>
+         f(w) =
+         <input type="text" id="eq">
+      </label>
+      <button id="render" type="button">Graph It</button>
+      <br>
+      <select id="colorization">
+         <option selected value="magnitude">Magnitude</option>
+         <option value="phase">Phase</option>
+         <option value="realPart">Real Part</option>
+         <option value="imaginaryPart">Imaginary Part</option>
+      </select>
+      <select id="colorizationFunction">
+         <option selected value="conformalColorThin">Contours</option>
+         <option value="nonconformalColorWithValue">No Contours</option>
+      </select>
+      <br>
+      <label>
+         Top X: <input type="number" id="topLeftX" value="-5">
+      </label>
+      <label>
+         Top Y: <input type="number" id="topLeftY" value="-5">
+      </label>
+      <label>
+         Bottom X: <input type="number" id="bottomRightX" value="5">
+      </label>
+      <label>
+         Bottom Y: <input type="number" id="bottomRightY" value="5">
+      </label>
+      <br>
+      <canvas id="graph" width="400" height="400">
+         No graph for  you!
+      </canvas>
+   </body>
+</html>
